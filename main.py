@@ -12,6 +12,9 @@ st.set_page_config(
     layout="wide"
 )
 
+# Increase pandas styler limit for large dataframes
+pd.set_option("styler.render.max_elements", 1000000)
+
 # --- Utilities ---
 
 def clean_price(val):
@@ -81,7 +84,11 @@ def normalize_columns(df):
     df['Descripcion'] = df['Descripcion'].astype(str).fillna("")
     df['Precio'] = df['Precio'].apply(clean_price).round(2)
     
-    return df[['Clave', 'Descripcion', 'Precio']], True
+    # Special handling for "Campo Extra": treat as numeric
+    if 'Campo Extra' in df.columns:
+        df['Campo Extra'] = pd.to_numeric(df['Campo Extra'], errors='coerce').fillna(0)
+    
+    return df, True
 
 def calculate_text_similarity(s1, s2):
     """Calculates similarity ratio between two strings."""
@@ -105,7 +112,22 @@ def convert_df_to_excel(results):
         
         # Common Sheet
         if not results['common_df'].empty:
-            results['common_df'].to_excel(writer, sheet_name='Coincidencias', index=False)
+            common_sheet_name = 'Coincidencias'
+            results['common_df'].to_excel(writer, sheet_name=common_sheet_name, index=False)
+            
+            # Apply Number Format to 'Campo Extra' if it exists
+            workbook = writer.book
+            worksheet = writer.sheets[common_sheet_name]
+            
+            if 'Campo Extra' in results['common_df'].columns:
+                # Find the column index (0-based)
+                col_idx = results['common_df'].columns.get_loc('Campo Extra')
+                
+                # Define format: 6 digits with leading zeros
+                id_format = workbook.add_format({'num_format': '000000'})
+                
+                # Apply to the column (width=None to keep default/autosize logic if any, or set a fixed width)
+                worksheet.set_column(col_idx, col_idx, None, id_format)
             
         # Only A Sheet
         if not results['only_a_df'].empty:
@@ -139,8 +161,9 @@ def main():
         with st.spinner("Procesando archivos..."):
             try:
                 # Load Data
-                df_a_raw = pd.read_excel(file_a)
-                df_b_raw = pd.read_excel(file_b)
+                # Load Data with dtype=str to preserve leading zeros in IDs
+                df_a_raw = pd.read_excel(file_a, dtype=str)
+                df_b_raw = pd.read_excel(file_b, dtype=str)
                 
                 df_a, valid_a = normalize_columns(df_a_raw)
                 df_b, valid_b = normalize_columns(df_b_raw)
@@ -165,12 +188,28 @@ def main():
                 # Text Similarity (expensive operation, apply only to common)
                 common['Similitud Texto'] = common.apply(lambda x: calculate_text_similarity(x['Descripcion_A'], x['Descripcion_B']), axis=1)
                 
-                # Only A
-                only_a = merged[merged['_merge'] == 'left_only'][['Clave', 'Descripcion_A', 'Precio_A']].rename(columns={'Descripcion_A': 'Descripcion', 'Precio_A': 'Precio'})
+                # Only A (Use direct filtering to preserve all original columns from A)
+                only_a = df_a[~df_a['Clave'].isin(df_b['Clave'])].copy()
                 
-                # Only B
-                only_b = merged[merged['_merge'] == 'right_only'][['Clave', 'Descripcion_B', 'Precio_B']].rename(columns={'Descripcion_B': 'Descripcion', 'Precio_B': 'Precio'})
+                # Only B (Use direct filtering to preserve all original columns from B)
+                only_b = df_b[~df_b['Clave'].isin(df_a['Clave'])].copy()
                 
+                # Define base columns for Common report
+                base_cols = ['Clave', 'Descripcion_A', 'Descripcion_B', 'Precio_A', 'Precio_B', 'Diferencia $', 'Diferencia %', 'Similitud Texto']
+                
+                # Identify extra columns in merged that are not in base_cols and not the merge indicator
+                # This ensures columns like 'Color', 'Marca', etc. are included
+                extra_cols = [c for c in common.columns if c not in base_cols and c != '_merge']
+                
+                # Special ordering: if 'Campo Extra' exists, put it first
+                if 'Campo Extra' in extra_cols:
+                    extra_cols.remove('Campo Extra')
+                    # Insert at the very beginning of the final list (even before Clave?) 
+                    # User requested: "at the very start of the output excel dataset"
+                    final_common_cols = ['Campo Extra'] + base_cols + extra_cols
+                else:
+                    final_common_cols = base_cols + extra_cols
+
                 # Results Object
                 results = {
                     'total_a': len(df_a),
@@ -178,7 +217,7 @@ def main():
                     'common_count': len(common),
                     'only_a_count': len(only_a),
                     'only_b_count': len(only_b),
-                    'common_df': common[['Clave', 'Descripcion_A', 'Descripcion_B', 'Precio_A', 'Precio_B', 'Diferencia $', 'Diferencia %', 'Similitud Texto']],
+                    'common_df': common[final_common_cols],
                     'only_a_df': only_a,
                     'only_b_df': only_b
                 }
